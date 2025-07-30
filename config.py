@@ -11,7 +11,7 @@ DB_CONFIG: Dict[str, Any] = {
     'port': int(os.getenv('MYSQL_PORT', '3306')),
     'user': os.getenv('MYSQL_USER', 'root'),
     'password': os.getenv('MYSQL_PASSWORD', '123456'),
-    'database': os.getenv('MYSQL_DATABASE', 'mcp'),
+    # 'database': os.getenv('MYSQL_DATABASE', 'mcp'),  # 移除默认数据库，让系统不指定数据库
     'autocommit': True,
     'charset': 'utf8mb4',
     'collation': 'utf8mb4_unicode_ci',
@@ -25,14 +25,16 @@ SERVER_CONFIG: Dict[str, Any] = {
     'name': 'MySQL MCP Server',
     'port': int(os.getenv('MCP_PORT', '8002')),
     'host': os.getenv('MCP_HOST', '0.0.0.0'),
-    'transport': 'streamable-http'
+    'transport': 'stdio'
 }
 
 # Logging configuration
 LOGGING_CONFIG: Dict[str, Any] = {
     'level': os.getenv('LOG_LEVEL', 'INFO'),
-    'file_path': os.getenv('LOG_FILE', '/Users/zbyang/mcp_getting_started/log/application.log'),
-    'format': '%(asctime)s - %(levelname)s - %(message)s'
+    'file_path': os.getenv('LOG_FILE', '/Users/zbyang/git/mcp_mysql_server/log/application.log'),
+    'format': '%(asctime)s - %(levelname)s - %(message)s',
+    'mcp_framework_log_level': os.getenv('MCP_LOG_LEVEL', 'WARNING'),  # Control MCP framework logging
+    'enable_mcp_request_logs': os.getenv('ENABLE_MCP_REQUEST_LOGS', 'false').lower() == 'true'  # Enable/disable MCP request logs
 }
 
 # Security configuration

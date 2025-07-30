@@ -9,6 +9,9 @@ from contextlib import contextmanager
 from mcp.server.fastmcp import FastMCP
 from config import DB_CONFIG, SERVER_CONFIG, LOGGING_CONFIG, SECURITY_CONFIG, DB_MANAGEMENT_CONFIG
 
+# Global variable to track current database
+CURRENT_DATABASE: Optional[str] = None
+
 # Configure logging
 logger = logging.getLogger()
 logger.setLevel(getattr(logging, LOGGING_CONFIG['level']))
@@ -18,14 +21,58 @@ file_handler = logging.FileHandler(LOGGING_CONFIG['file_path'])
 file_handler.setFormatter(logging.Formatter(LOGGING_CONFIG['format']))
 
 # Console handler
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(logging.Formatter(LOGGING_CONFIG['format']))
+# console_handler = logging.StreamHandler()
+# console_handler.setFormatter(logging.Formatter(LOGGING_CONFIG['format']))
 
 logger.addHandler(file_handler)
-logger.addHandler(console_handler)
+# logger.addHandler(console_handler)
+
+def configure_mcp_logging():
+    """Configure MCP framework logging levels"""
+    mcp_log_level = getattr(logging, LOGGING_CONFIG['mcp_framework_log_level'])
+    
+    # Control all MCP-related loggers
+    mcp_loggers = [
+        'mcp',
+        'mcp.server', 
+        'mcp.server.fastmcp',
+        'mcp.server.models',
+        'mcp.server.stdio',
+        'mcp.server.http'
+    ]
+    
+    for logger_name in mcp_loggers:
+        mcp_logger = logging.getLogger(logger_name)
+        mcp_logger.setLevel(mcp_log_level)
+        # Prevent propagation to avoid duplicate logs
+        mcp_logger.propagate = False
+
+# Configure MCP framework logging
+configure_mcp_logging()
+
+def log_sql_execution(func):
+    """Decorator to log SQL execution"""
+    def wrapper(*args, **kwargs):
+        # Get the function name for logging
+        func_name = func.__name__
+        
+        # Log the function call
+        logger.info(f"[SQL EXECUTION] {func_name} called")
+        
+        try:
+            result = func(*args, **kwargs)
+            logger.info(f"[SQL EXECUTION] {func_name} completed successfully")
+            return result
+        except Exception as e:
+            logger.error(f"[SQL EXECUTION] {func_name} failed with error: {e}")
+            raise
+    return wrapper
 
 # Initialize MCP server
-mcp = FastMCP(SERVER_CONFIG['name'], port=SERVER_CONFIG['port'], host=SERVER_CONFIG['host'])
+if SERVER_CONFIG['transport'] == 'stdio':
+    mcp = FastMCP(SERVER_CONFIG['name'])
+else:
+    mcp = FastMCP(SERVER_CONFIG['name'], port=SERVER_CONFIG['port'], host=SERVER_CONFIG['host'])
 
 def log_client_call(func):
     """Decorator to log client function calls"""
@@ -42,12 +89,69 @@ def log_client_call(func):
 
 @contextmanager
 def get_mysql_connection():
-    """Context manager for MySQL connections with automatic cleanup"""
+    """Context manager for MySQL connections with automatic cleanup and SQL logging"""
     connection = None
     try:
-        connection = mysql.connector.connect(**DB_CONFIG)
+        # Create connection config based on current database
+        connection_config = {
+            'host': DB_CONFIG['host'],
+            'port': DB_CONFIG['port'],
+            'user': DB_CONFIG['user'],
+            'password': DB_CONFIG['password'],
+            'autocommit': DB_CONFIG['autocommit'],
+            'charset': DB_CONFIG['charset'],
+            'collation': DB_CONFIG['collation'],
+            'connect_timeout': DB_CONFIG['connect_timeout'],
+            'read_timeout': DB_CONFIG['read_timeout'],
+            'write_timeout': DB_CONFIG['write_timeout']
+        }
+        
+        # Only add database if one is currently selected
+        if CURRENT_DATABASE:
+            connection_config['database'] = CURRENT_DATABASE
+        
+        connection = mysql.connector.connect(**connection_config)
         if connection.is_connected():
-            logger.debug("MySQL connection established")
+            logger.debug(f"MySQL connection established{' to database ' + CURRENT_DATABASE if CURRENT_DATABASE else ' (no database)'}")
+            
+            # Create a custom cursor class that logs SQL statements
+            class LoggingCursor:
+                def __init__(self, cursor):
+                    self.cursor = cursor
+                
+                def execute(self, query, params=None):
+                    if params:
+                        logger.info(f"[SQL] {query} with params: {params}")
+                    else:
+                        logger.info(f"[SQL] {query}")
+                    return self.cursor.execute(query, params)
+                
+                def fetchall(self):
+                    return self.cursor.fetchall()
+                
+                def fetchone(self):
+                    return self.cursor.fetchone()
+                
+                def close(self):
+                    return self.cursor.close()
+                
+                @property
+                def rowcount(self):
+                    return self.cursor.rowcount
+                
+                @property
+                def lastrowid(self):
+                    return self.cursor.lastrowid
+            
+            # Monkey patch the connection's cursor method
+            original_cursor = connection.cursor
+            
+            def logging_cursor(*args, **kwargs):
+                cursor = original_cursor(*args, **kwargs)
+                return LoggingCursor(cursor)
+            
+            connection.cursor = logging_cursor
+            
             yield connection
         else:
             raise Error("Failed to establish MySQL connection")
@@ -58,6 +162,69 @@ def get_mysql_connection():
         if connection and connection.is_connected():
             connection.close()
             logger.debug("MySQL connection closed")
+
+@contextmanager
+def get_mysql_connection_no_db():
+    """Context manager for MySQL connections without database specification and SQL logging"""
+    connection = None
+    try:
+        connection = mysql.connector.connect(
+            host=DB_CONFIG['host'],
+            port=DB_CONFIG['port'],
+            user=DB_CONFIG['user'],
+            password=DB_CONFIG['password']
+        )
+        if connection.is_connected():
+            logger.debug("MySQL connection established (no database)")
+            
+            # Create a custom cursor class that logs SQL statements
+            class LoggingCursor:
+                def __init__(self, cursor):
+                    self.cursor = cursor
+                
+                def execute(self, query, params=None):
+                    if params:
+                        logger.info(f"[SQL] {query} with params: {params}")
+                    else:
+                        logger.info(f"[SQL] {query}")
+                    return self.cursor.execute(query, params)
+                
+                def fetchall(self):
+                    return self.cursor.fetchall()
+                
+                def fetchone(self):
+                    return self.cursor.fetchone()
+                
+                def close(self):
+                    return self.cursor.close()
+                
+                @property
+                def rowcount(self):
+                    return self.cursor.rowcount
+                
+                @property
+                def lastrowid(self):
+                    return self.cursor.lastrowid
+            
+            # Monkey patch the connection's cursor method
+            original_cursor = connection.cursor
+            
+            def logging_cursor(*args, **kwargs):
+                cursor = original_cursor(*args, **kwargs)
+                return LoggingCursor(cursor)
+            
+            connection.cursor = logging_cursor
+            
+            yield connection
+        else:
+            raise Error("Failed to establish MySQL connection")
+    except Error as e:
+        logger.error(f"MySQL connection error: {e}")
+        raise
+    finally:
+        if connection and connection.is_connected():
+            connection.close()
+            logger.debug("MySQL connection closed (no database)")
 
 def validate_table_name(table_name: str) -> bool:
     """Validate table name to prevent SQL injection"""
@@ -140,6 +307,9 @@ def list_tables() -> Dict[str, Any]:
     Returns:
         Dict containing list of table names
     """
+    if not CURRENT_DATABASE:
+        return format_error("No database selected", "Please use switch_database() to select a database first")
+    
     try:
         with get_mysql_connection() as connection:
             cursor = connection.cursor()
@@ -147,7 +317,7 @@ def list_tables() -> Dict[str, Any]:
             tables = [row[0] for row in cursor.fetchall()]
             cursor.close()
             
-            return format_result({"tables": tables}, f"Found {len(tables)} tables")
+            return format_result({"tables": tables}, f"Found {len(tables)} tables in database '{CURRENT_DATABASE}'")
     except Exception as e:
         logger.error(f"Failed to list tables: {e}")
         return format_error(e, "Failed to list tables")
@@ -165,6 +335,9 @@ def get_table_schema(table_name: str) -> Dict[str, Any]:
     Returns:
         Dict containing table schema information
     """
+    if not CURRENT_DATABASE:
+        return format_error("No database selected", "Please use switch_database() to select a database first")
+    
     if not validate_table_name(table_name):
         return format_error("Invalid table name", "Table name contains invalid characters")
     
@@ -186,7 +359,7 @@ def get_table_schema(table_name: str) -> Dict[str, Any]:
                     "extra": row[5]
                 })
             
-            return format_result({"schema": schema}, f"Schema retrieved for table '{table_name}'")
+            return format_result({"schema": schema}, f"Schema retrieved for table '{table_name}' in database '{CURRENT_DATABASE}'")
     except Exception as e:
         logger.error(f"Failed to get schema for table '{table_name}': {e}")
         return format_error(e, f"Failed to get schema for table '{table_name}'")
@@ -206,6 +379,9 @@ def read_table(table_name: str, limit: Optional[int] = 100, offset: Optional[int
     Returns:
         Dict containing table data
     """
+    if not CURRENT_DATABASE:
+        return format_error("No database selected", "Please use switch_database() to select a database first")
+    
     if not validate_table_name(table_name):
         return format_error("Invalid table name", "Table name contains invalid characters")
     
@@ -230,7 +406,6 @@ def read_table(table_name: str, limit: Optional[int] = 100, offset: Optional[int
                 if offset is not None:
                     query += f" OFFSET {offset}"
             
-            logger.info(f"Executing SQL: {query}")
             cursor.execute(query)
             rows = cursor.fetchall()
             cursor.close()
@@ -238,8 +413,9 @@ def read_table(table_name: str, limit: Optional[int] = 100, offset: Optional[int
             return format_result({
                 "data": rows,
                 "count": len(rows),
-                "table": table_name
-            }, f"Retrieved {len(rows)} rows from table '{table_name}'")
+                "table": table_name,
+                "database": CURRENT_DATABASE
+            }, f"Retrieved {len(rows)} rows from table '{table_name}' in database '{CURRENT_DATABASE}'")
     except Exception as e:
         logger.error(f"Failed to read from table '{table_name}': {e}")
         return format_error(e, f"Failed to read from table '{table_name}'")
@@ -258,6 +434,9 @@ def write_table(table_name: str, data: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Dict containing operation status
     """
+    if not CURRENT_DATABASE:
+        return format_error("No database selected", "Please use switch_database() to select a database first")
+    
     if not validate_table_name(table_name):
         return format_error("Invalid table name", "Table name contains invalid characters")
     
@@ -273,15 +452,15 @@ def write_table(table_name: str, data: Dict[str, Any]) -> Dict[str, Any]:
             values = ', '.join(['%s'] * len(data))
             query = f"INSERT INTO {table_name} ({columns}) VALUES ({values})"
             
-            logger.info(f"Executing SQL: {query} with values: {tuple(data.values())}")
             cursor.execute(query, tuple(data.values()))
             last_insert_id = cursor.lastrowid
             cursor.close()
             
             return format_result({
                 "inserted_id": last_insert_id,
-                "affected_rows": cursor.rowcount
-            }, f"Data inserted successfully into table '{table_name}'")
+                "affected_rows": cursor.rowcount,
+                "database": CURRENT_DATABASE
+            }, f"Data inserted successfully into table '{table_name}' in database '{CURRENT_DATABASE}'")
     except Exception as e:
         logger.error(f"Failed to write to table '{table_name}': {e}")
         return format_error(e, f"Failed to write to table '{table_name}'")
@@ -301,6 +480,9 @@ def update_table(table_name: str, data: Dict[str, Any], where_conditions: Dict[s
     Returns:
         Dict containing operation status
     """
+    if not CURRENT_DATABASE:
+        return format_error("No database selected", "Please use switch_database() to select a database first")
+    
     if not validate_table_name(table_name):
         return format_error("Invalid table name", "Table name contains invalid characters")
     
@@ -322,14 +504,14 @@ def update_table(table_name: str, data: Dict[str, Any], where_conditions: Dict[s
             # Combine values for execution
             values = tuple(data.values()) + tuple(where_conditions.values())
             
-            logger.info(f"Executing SQL: {query} with values: {values}")
             cursor.execute(query, values)
             affected_rows = cursor.rowcount
             cursor.close()
             
             return format_result({
-                "affected_rows": affected_rows
-            }, f"Updated {affected_rows} rows in table '{table_name}'")
+                "affected_rows": affected_rows,
+                "database": CURRENT_DATABASE
+            }, f"Updated {affected_rows} rows in table '{table_name}' in database '{CURRENT_DATABASE}'")
     except Exception as e:
         logger.error(f"Failed to update table '{table_name}': {e}")
         return format_error(e, f"Failed to update table '{table_name}'")
@@ -348,6 +530,9 @@ def delete_from_table(table_name: str, where_conditions: Dict[str, Any]) -> Dict
     Returns:
         Dict containing operation status
     """
+    if not CURRENT_DATABASE:
+        return format_error("No database selected", "Please use switch_database() to select a database first")
+    
     if not validate_table_name(table_name):
         return format_error("Invalid table name", "Table name contains invalid characters")
     
@@ -362,14 +547,14 @@ def delete_from_table(table_name: str, where_conditions: Dict[str, Any]) -> Dict
             where_clause = ' AND '.join([f"{k} = %s" for k in where_conditions.keys()])
             query = f"DELETE FROM {table_name} WHERE {where_clause}"
             
-            logger.info(f"Executing SQL: {query} with values: {tuple(where_conditions.values())}")
             cursor.execute(query, tuple(where_conditions.values()))
             affected_rows = cursor.rowcount
             cursor.close()
             
             return format_result({
-                "affected_rows": affected_rows
-            }, f"Deleted {affected_rows} rows from table '{table_name}'")
+                "affected_rows": affected_rows,
+                "database": CURRENT_DATABASE
+            }, f"Deleted {affected_rows} rows from table '{table_name}' in database '{CURRENT_DATABASE}'")
     except Exception as e:
         logger.error(f"Failed to delete from table '{table_name}': {e}")
         return format_error(e, f"Failed to delete from table '{table_name}'")
@@ -388,6 +573,9 @@ def execute_sql(query: str) -> Dict[str, Any]:
     Returns:
         Dict containing query results
     """
+    if not CURRENT_DATABASE:
+        return format_error("No database selected", "Please use switch_database() to select a database first")
+    
     if not validate_sql_query(query):
         return format_error("Invalid query", "Only SELECT queries are allowed for security reasons")
     
@@ -395,15 +583,15 @@ def execute_sql(query: str) -> Dict[str, Any]:
         with get_mysql_connection() as connection:
             cursor = connection.cursor(dictionary=True)
             
-            logger.info(f"Executing SQL: {query}")
             cursor.execute(query)
             rows = cursor.fetchall()
             cursor.close()
             
             return format_result({
                 "data": rows,
-                "count": len(rows)
-            }, f"Query executed successfully, returned {len(rows)} rows")
+                "count": len(rows),
+                "database": CURRENT_DATABASE
+            }, f"Query executed successfully, returned {len(rows)} rows from database '{CURRENT_DATABASE}'")
     except Exception as e:
         logger.error(f"Failed to execute SQL query: {e}")
         return format_error(e, "Failed to execute SQL query")
@@ -421,6 +609,9 @@ def get_table_stats(table_name: str) -> Dict[str, Any]:
     Returns:
         Dict containing table statistics
     """
+    if not CURRENT_DATABASE:
+        return format_error("No database selected", "Please use switch_database() to select a database first")
+    
     if not validate_table_name(table_name):
         return format_error("Invalid table name", "Table name contains invalid characters")
     
@@ -454,12 +645,16 @@ def get_table_stats(table_name: str) -> Dict[str, Any]:
                     "actual_rows": row_count,
                     "data_size_bytes": table_info[2],
                     "index_size_bytes": table_info[3],
-                    "total_size_bytes": table_info[4]
+                    "total_size_bytes": table_info[4],
+                    "database": CURRENT_DATABASE
                 }
             else:
-                stats = {"row_count": row_count}
+                stats = {
+                    "row_count": row_count,
+                    "database": CURRENT_DATABASE
+                }
             
-            return format_result(stats, f"Statistics retrieved for table '{table_name}'")
+            return format_result(stats, f"Statistics retrieved for table '{table_name}' in database '{CURRENT_DATABASE}'")
     except Exception as e:
         logger.error(f"Failed to get stats for table '{table_name}': {e}")
         return format_error(e, f"Failed to get stats for table '{table_name}'")
@@ -480,6 +675,9 @@ def search_table(table_name: str, search_column: str, search_value: str, limit: 
     Returns:
         Dict containing search results
     """
+    if not CURRENT_DATABASE:
+        return format_error("No database selected", "Please use switch_database() to select a database first")
+    
     if not validate_table_name(table_name):
         return format_error("Invalid table name", "Table name contains invalid characters")
     
@@ -502,7 +700,6 @@ def search_table(table_name: str, search_column: str, search_value: str, limit: 
                 query += f" LIMIT {limit}"
             
             search_pattern = f"%{search_value}%"
-            logger.info(f"Executing SQL: {query} with pattern: {search_pattern}")
             cursor.execute(query, (search_pattern,))
             rows = cursor.fetchall()
             cursor.close()
@@ -511,8 +708,9 @@ def search_table(table_name: str, search_column: str, search_value: str, limit: 
                 "data": rows,
                 "count": len(rows),
                 "search_column": search_column,
-                "search_value": search_value
-            }, f"Found {len(rows)} matching rows in table '{table_name}'")
+                "search_value": search_value,
+                "database": CURRENT_DATABASE
+            }, f"Found {len(rows)} matching rows in table '{table_name}' in database '{CURRENT_DATABASE}'")
     except Exception as e:
         logger.error(f"Failed to search table '{table_name}': {e}")
         return format_error(e, f"Failed to search table '{table_name}'")
@@ -527,6 +725,9 @@ def get_database_info() -> Dict[str, Any]:
     Returns:
         Dict containing database information
     """
+    if not CURRENT_DATABASE:
+        return format_error("No database selected", "Please use switch_database() to select a database first")
+    
     try:
         with get_mysql_connection() as connection:
             cursor = connection.cursor()
@@ -578,19 +779,11 @@ def list_databases() -> Dict[str, Any]:
     """
     try:
         # Connect without specifying database to get server-level access
-        connection = mysql.connector.connect(
-            host=DB_CONFIG['host'],
-            port=DB_CONFIG['port'],
-            user=DB_CONFIG['user'],
-            password=DB_CONFIG['password']
-        )
-        
-        if connection.is_connected():
+        with get_mysql_connection_no_db() as connection:
             cursor = connection.cursor()
             cursor.execute("SHOW DATABASES")
             databases = [row[0] for row in cursor.fetchall()]
             cursor.close()
-            connection.close()
             
             return format_result({"databases": databases}, f"Found {len(databases)} databases")
     except Exception as e:
@@ -624,23 +817,14 @@ def create_database(database_name: str, charset: str = None, collation: str = No
     
     try:
         # Connect without specifying database
-        connection = mysql.connector.connect(
-            host=DB_CONFIG['host'],
-            port=DB_CONFIG['port'],
-            user=DB_CONFIG['user'],
-            password=DB_CONFIG['password']
-        )
-        
-        if connection.is_connected():
+        with get_mysql_connection_no_db() as connection:
             cursor = connection.cursor()
             
             # Create database with charset and collation
             query = f"CREATE DATABASE IF NOT EXISTS `{database_name}` CHARACTER SET {charset} COLLATE {collation}"
-            logger.info(f"Executing SQL: {query}")
             cursor.execute(query)
             
             cursor.close()
-            connection.close()
             
             result_data = {
                 "database_name": database_name,
@@ -692,14 +876,7 @@ def delete_database(database_name: str, force: bool = False) -> Dict[str, Any]:
                 logger.info(f"Backup created: {backup_name}")
         
         # Connect without specifying database
-        connection = mysql.connector.connect(
-            host=DB_CONFIG['host'],
-            port=DB_CONFIG['port'],
-            user=DB_CONFIG['user'],
-            password=DB_CONFIG['password']
-        )
-        
-        if connection.is_connected():
+        with get_mysql_connection_no_db() as connection:
             cursor = connection.cursor()
             
             if force:
@@ -707,11 +884,9 @@ def delete_database(database_name: str, force: bool = False) -> Dict[str, Any]:
             else:
                 query = f"DROP DATABASE `{database_name}`"
             
-            logger.info(f"Executing SQL: {query}")
             cursor.execute(query)
             
             cursor.close()
-            connection.close()
             
             result_data = {
                 "database_name": database_name,
@@ -739,31 +914,66 @@ def switch_database(database_name: str) -> Dict[str, Any]:
     Returns:
         Dict containing operation status
     """
+    global CURRENT_DATABASE
+    
     if not validate_table_name(database_name):
         return format_error("Invalid database name", "Database name contains invalid characters")
     
     try:
         # Test connection to the new database
-        test_connection = mysql.connector.connect(
-            host=DB_CONFIG['host'],
-            port=DB_CONFIG['port'],
-            user=DB_CONFIG['user'],
-            password=DB_CONFIG['password'],
-            database=database_name
-        )
+        connection_config = {
+            'host': DB_CONFIG['host'],
+            'port': DB_CONFIG['port'],
+            'user': DB_CONFIG['user'],
+            'password': DB_CONFIG['password'],
+            'database': database_name
+        }
+        
+        test_connection = mysql.connector.connect(**connection_config)
         
         if test_connection.is_connected():
+            # Create a custom cursor class that logs SQL statements
+            class LoggingCursor:
+                def __init__(self, cursor):
+                    self.cursor = cursor
+                
+                def execute(self, query, params=None):
+                    if params:
+                        logger.info(f"[SQL] {query} with params: {params}")
+                    else:
+                        logger.info(f"[SQL] {query}")
+                    return self.cursor.execute(query, params)
+                
+                def fetchall(self):
+                    return self.cursor.fetchall()
+                
+                def fetchone(self):
+                    return self.cursor.fetchone()
+                
+                def close(self):
+                    return self.cursor.close()
+            
+            # Monkey patch the connection's cursor method
+            original_cursor = test_connection.cursor
+            
+            def logging_cursor(*args, **kwargs):
+                cursor = original_cursor(*args, **kwargs)
+                return LoggingCursor(cursor)
+            
+            test_connection.cursor = logging_cursor
+            
             cursor = test_connection.cursor()
             cursor.execute("SELECT DATABASE()")
             current_db = cursor.fetchone()[0]
             cursor.close()
             test_connection.close()
             
-            # Update the global configuration
-            DB_CONFIG['database'] = database_name
+            # Update the global variable
+            previous_database = CURRENT_DATABASE
+            CURRENT_DATABASE = database_name
             
             return format_result({
-                "previous_database": DB_CONFIG.get('database', 'unknown'),
+                "previous_database": previous_database,
                 "current_database": database_name
             }, f"Successfully switched to database '{database_name}'")
     except Exception as e:
@@ -788,61 +998,121 @@ def get_database_details(database_name: str = None) -> Dict[str, Any]:
     
     try:
         # Connect to the specified database or current database
-        connection_config = DB_CONFIG.copy()
         if database_name:
+            # Create a temporary connection to the specified database
+            connection_config = DB_CONFIG.copy()
             connection_config['database'] = database_name
+            
+            connection = mysql.connector.connect(**connection_config)
+            
+            if connection.is_connected():
+                # Create a custom cursor class that logs SQL statements
+                class LoggingCursor:
+                    def __init__(self, cursor):
+                        self.cursor = cursor
+                    
+                    def execute(self, query, params=None):
+                        if params:
+                            logger.info(f"[SQL] {query} with params: {params}")
+                        else:
+                            logger.info(f"[SQL] {query}")
+                        return self.cursor.execute(query, params)
+                    
+                    def fetchall(self):
+                        return self.cursor.fetchall()
+                    
+                    def fetchone(self):
+                        return self.cursor.fetchone()
+                    
+                    def close(self):
+                        return self.cursor.close()
+                
+                # Monkey patch the connection's cursor method
+                original_cursor = connection.cursor
+                
+                def logging_cursor(*args, **kwargs):
+                    cursor = original_cursor(*args, **kwargs)
+                    return LoggingCursor(cursor)
+                
+                connection.cursor = logging_cursor
+                
+                cursor = connection.cursor()
+                
+                # Get database name
+                cursor.execute("SELECT DATABASE()")
+                current_db = cursor.fetchone()[0]
+                
+                # Get table count
+                cursor.execute("SHOW TABLES")
+                tables = cursor.fetchall()
+                table_count = len(tables)
+                
+                # Get database size and other details
+                cursor.execute("""
+                    SELECT 
+                        table_schema,
+                        SUM(data_length + index_length) as total_size,
+                        SUM(data_length) as data_size,
+                        SUM(index_length) as index_size,
+                        COUNT(*) as table_count
+                    FROM information_schema.tables 
+                    WHERE table_schema = %s
+                    GROUP BY table_schema
+                """, (current_db,))
+                
+                db_info = cursor.fetchone()
+                cursor.close()
+                connection.close()
+        else:
+            # Use the standard connection manager for current database
+            with get_mysql_connection() as connection:
+                cursor = connection.cursor()
+                
+                # Get database name
+                cursor.execute("SELECT DATABASE()")
+                current_db = cursor.fetchone()[0]
+                
+                # Get table count
+                cursor.execute("SHOW TABLES")
+                tables = cursor.fetchall()
+                table_count = len(tables)
+                
+                # Get database size and other details
+                cursor.execute("""
+                    SELECT 
+                        table_schema,
+                        SUM(data_length + index_length) as total_size,
+                        SUM(data_length) as data_size,
+                        SUM(index_length) as index_size,
+                        COUNT(*) as table_count
+                    FROM information_schema.tables 
+                    WHERE table_schema = %s
+                    GROUP BY table_schema
+                """, (current_db,))
+                
+                db_info = cursor.fetchone()
+                cursor.close()
         
-        connection = mysql.connector.connect(**connection_config)
+        if db_info:
+            details = {
+                "database_name": db_info[0],
+                "table_count": db_info[4],
+                "total_size_bytes": db_info[1] if db_info[1] else 0,
+                "data_size_bytes": db_info[2] if db_info[2] else 0,
+                "index_size_bytes": db_info[3] if db_info[3] else 0,
+                "tables": [table[0] for table in tables]
+            }
+        else:
+            details = {
+                "database_name": current_db,
+                "table_count": table_count,
+                "total_size_bytes": 0,
+                "data_size_bytes": 0,
+                "index_size_bytes": 0,
+                "tables": [table[0] for table in tables]
+            }
         
-        if connection.is_connected():
-            cursor = connection.cursor()
-            
-            # Get database name
-            cursor.execute("SELECT DATABASE()")
-            current_db = cursor.fetchone()[0]
-            
-            # Get table count
-            cursor.execute("SHOW TABLES")
-            tables = cursor.fetchall()
-            table_count = len(tables)
-            
-            # Get database size and other details
-            cursor.execute("""
-                SELECT 
-                    table_schema,
-                    SUM(data_length + index_length) as total_size,
-                    SUM(data_length) as data_size,
-                    SUM(index_length) as index_size,
-                    COUNT(*) as table_count
-                FROM information_schema.tables 
-                WHERE table_schema = %s
-                GROUP BY table_schema
-            """, (current_db,))
-            
-            db_info = cursor.fetchone()
-            cursor.close()
-            connection.close()
-            
-            if db_info:
-                details = {
-                    "database_name": db_info[0],
-                    "table_count": db_info[4],
-                    "total_size_bytes": db_info[1] if db_info[1] else 0,
-                    "data_size_bytes": db_info[2] if db_info[2] else 0,
-                    "index_size_bytes": db_info[3] if db_info[3] else 0,
-                    "tables": [table[0] for table in tables]
-                }
-            else:
-                details = {
-                    "database_name": current_db,
-                    "table_count": table_count,
-                    "total_size_bytes": 0,
-                    "data_size_bytes": 0,
-                    "index_size_bytes": 0,
-                    "tables": [table[0] for table in tables]
-                }
-            
-            return format_result(details, f"Database details retrieved for '{current_db}'")
+        return format_result(details, f"Database details retrieved for '{current_db}'")
     except Exception as e:
         logger.error(f"Failed to get database details for '{database_name}': {e}")
         return format_error(e, f"Failed to get database details for '{database_name}'")
@@ -866,14 +1136,7 @@ def copy_database(source_database: str, target_database: str) -> Dict[str, Any]:
     
     try:
         # Connect without specifying database
-        connection = mysql.connector.connect(
-            host=DB_CONFIG['host'],
-            port=DB_CONFIG['port'],
-            user=DB_CONFIG['user'],
-            password=DB_CONFIG['password']
-        )
-        
-        if connection.is_connected():
+        with get_mysql_connection_no_db() as connection:
             cursor = connection.cursor()
             
             # Create target database
@@ -901,7 +1164,6 @@ def copy_database(source_database: str, target_database: str) -> Dict[str, Any]:
                 copied_tables.append(table_name)
             
             cursor.close()
-            connection.close()
             
             return format_result({
                 "source_database": source_database,
@@ -960,21 +1222,18 @@ def get_current_database() -> Dict[str, Any]:
         Dict containing current database name
     """
     try:
-        with get_mysql_connection() as connection:
-            cursor = connection.cursor()
-            cursor.execute("SELECT DATABASE()")
-            current_db = cursor.fetchone()[0]
-            cursor.close()
-            
-            return format_result({
-                "current_database": current_db
-            }, f"Current database is '{current_db}'")
+        return format_result({
+            "current_database": CURRENT_DATABASE
+        }, f"Current database is '{CURRENT_DATABASE if CURRENT_DATABASE else 'None (no database selected)'}'")
     except Exception as e:
         logger.error(f"Failed to get current database: {e}")
         return format_error(e, "Failed to get current database")
 
 # Start the MCP server
 if __name__ == "__main__":
-    logger.info(f"Starting {SERVER_CONFIG['name']} on {SERVER_CONFIG['host']}:{SERVER_CONFIG['port']}")
-    logger.info(f"Database: {DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}")
+    if SERVER_CONFIG['transport'] == 'stdio':
+        logger.info(f"Starting {SERVER_CONFIG['name']} with stdio transport")
+    else:
+        logger.info(f"Starting {SERVER_CONFIG['name']} on {SERVER_CONFIG['host']}:{SERVER_CONFIG['port']}")
+    logger.info(f"Database: {DB_CONFIG['host']}:{DB_CONFIG['port']} (no default database)")
     mcp.run(transport=SERVER_CONFIG['transport'])
