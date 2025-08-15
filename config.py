@@ -10,7 +10,7 @@ DB_CONFIG: Dict[str, Any] = {
     'host': os.getenv('MYSQL_HOST', '127.0.0.1'),
     'port': int(os.getenv('MYSQL_PORT', '3306')),
     'user': os.getenv('MYSQL_USER', 'root'),
-    'password': os.getenv('MYSQL_PASSWORD', '123456'),
+    'password': os.getenv('MYSQL_PASSWORD', 'zhongbin'),
     # 'database': os.getenv('MYSQL_DATABASE', 'mcp'),  # 移除默认数据库，让系统不指定数据库
     'autocommit': True,
     'charset': 'utf8mb4',

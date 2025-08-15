@@ -235,19 +235,12 @@ def validate_table_name(table_name: str) -> bool:
     return bool(re.match(pattern, table_name))
 
 def validate_sql_query(query: str) -> bool:
-    """Basic SQL query validation to prevent dangerous operations"""
+    """Basic SQL query validation"""
     if not query or not isinstance(query, str):
         return False
     
-    # Check query length
-    if len(query) > SECURITY_CONFIG['max_query_length']:
-        return False
-    
-    # Convert to lowercase for checking
-    query_lower = query.strip().lower()
-    
-    # Only allow SELECT queries for safety
-    if not query_lower.startswith('select'):
+    # Only check if query is not empty
+    if not query.strip():
         return False
     
     return True
@@ -367,7 +360,7 @@ def get_table_schema(table_name: str) -> Dict[str, Any]:
 # Tool: Read data from table
 @log_client_call
 @mcp.tool()
-def read_table(table_name: str, limit: Optional[int] = 100, offset: Optional[int] = 0) -> Dict[str, Any]:
+def read_table(table_name: str, limit: int = 100, offset: int = 0) -> Dict[str, Any]:
     """
     Reads data from the specified table and returns it.
     
@@ -385,14 +378,14 @@ def read_table(table_name: str, limit: Optional[int] = 100, offset: Optional[int
     if not validate_table_name(table_name):
         return format_error("Invalid table name", "Table name contains invalid characters")
     
-    if limit is not None and (not isinstance(limit, int) or limit < 0):
+    if limit < 0:
         return format_error("Invalid limit", "Limit must be a positive integer")
     
-    if offset is not None and (not isinstance(offset, int) or offset < 0):
+    if offset < 0:
         return format_error("Invalid offset", "Offset must be a positive integer")
     
     # Apply security limit
-    if limit is None or limit > SECURITY_CONFIG['max_results']:
+    if limit > SECURITY_CONFIG['max_results']:
         limit = SECURITY_CONFIG['max_results']
     
     try:
@@ -400,11 +393,7 @@ def read_table(table_name: str, limit: Optional[int] = 100, offset: Optional[int
             cursor = connection.cursor(dictionary=True)
             
             # Build query with limit and offset
-            query = f"SELECT * FROM {table_name}"
-            if limit is not None:
-                query += f" LIMIT {limit}"
-                if offset is not None:
-                    query += f" OFFSET {offset}"
+            query = f"SELECT * FROM {table_name} LIMIT {limit} OFFSET {offset}"
             
             cursor.execute(query)
             rows = cursor.fetchall()
@@ -559,16 +548,15 @@ def delete_from_table(table_name: str, where_conditions: Dict[str, Any]) -> Dict
         logger.error(f"Failed to delete from table '{table_name}': {e}")
         return format_error(e, f"Failed to delete from table '{table_name}'")
 
-# Tool: Execute custom SQL query (SELECT only for safety)
+# Tool: Execute custom SQL query
 @log_client_call
 @mcp.tool()
 def execute_sql(query: str) -> Dict[str, Any]:
     """
     Executes a custom SQL query and returns the result.
-    Note: Only SELECT queries are allowed for security reasons.
     
     Args:
-        query: SQL query to execute (SELECT only)
+        query: SQL query to execute (any valid SQL)
         
     Returns:
         Dict containing query results
@@ -577,7 +565,7 @@ def execute_sql(query: str) -> Dict[str, Any]:
         return format_error("No database selected", "Please use switch_database() to select a database first")
     
     if not validate_sql_query(query):
-        return format_error("Invalid query", "Only SELECT queries are allowed for security reasons")
+        return format_error("Invalid query", "Query validation failed")
     
     try:
         with get_mysql_connection() as connection:
@@ -595,6 +583,152 @@ def execute_sql(query: str) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Failed to execute SQL query: {e}")
         return format_error(e, "Failed to execute SQL query")
+
+# Tool: Create table
+@log_client_call
+@mcp.tool()
+def create_table(table_name: str, columns: List[Dict[str, Any]], options: Dict[str, Any] = None) -> Dict[str, Any]:
+    """
+    Creates a new table with the specified columns and options.
+    
+    Args:
+        table_name: Name of the table to create
+        columns: List of column definitions, each containing:
+                - name: Column name
+                - type: Data type (e.g., 'INT', 'VARCHAR(100)', 'DECIMAL(10,2)')
+                - constraints: List of constraints (e.g., ['NOT NULL', 'PRIMARY KEY', 'AUTO_INCREMENT'])
+                - default: Default value (optional)
+        options: Additional table options (e.g., engine, charset, collation)
+        
+    Returns:
+        Dict containing operation status
+    """
+    if not CURRENT_DATABASE:
+        return format_error("No database selected", "Please use switch_database() to select a database first")
+    
+    if not validate_table_name(table_name):
+        return format_error("Invalid table name", "Table name contains invalid characters")
+    
+    if not columns or not isinstance(columns, list):
+        return format_error("Invalid columns", "Columns must be a non-empty list")
+    
+    try:
+        with get_mysql_connection() as connection:
+            cursor = connection.cursor()
+            
+            # Build CREATE TABLE statement
+            column_definitions = []
+            for column in columns:
+                if not isinstance(column, dict) or 'name' not in column or 'type' not in column:
+                    return format_error("Invalid column definition", "Each column must have 'name' and 'type'")
+                
+                col_name = column['name']
+                col_type = column['type']
+                
+                # Validate column name
+                if not validate_table_name(col_name):
+                    return format_error("Invalid column name", f"Column name '{col_name}' contains invalid characters")
+                
+                # Build column definition
+                col_def = f"`{col_name}` {col_type}"
+                
+                # Add constraints
+                if 'constraints' in column and isinstance(column['constraints'], list):
+                    for constraint in column['constraints']:
+                        if isinstance(constraint, str):
+                            col_def += f" {constraint}"
+                
+                # Add default value
+                if 'default' in column:
+                    if column['default'] is None:
+                        col_def += " DEFAULT NULL"
+                    elif isinstance(column['default'], str):
+                        col_def += f" DEFAULT '{column['default']}'"
+                    else:
+                        col_def += f" DEFAULT {column['default']}"
+                
+                column_definitions.append(col_def)
+            
+            # Build the complete CREATE TABLE statement
+            create_sql = f"CREATE TABLE `{table_name}` (\n  "
+            create_sql += ",\n  ".join(column_definitions)
+            create_sql += "\n)"
+            
+            # Add table options
+            if options:
+                if 'engine' in options:
+                    create_sql += f" ENGINE={options['engine']}"
+                if 'charset' in options:
+                    create_sql += f" CHARACTER SET {options['charset']}"
+                if 'collation' in options:
+                    create_sql += f" COLLATE {options['collation']}"
+            
+            # Execute the CREATE TABLE statement
+            cursor.execute(create_sql)
+            cursor.close()
+            
+            return format_result({
+                "table_name": table_name,
+                "columns": len(columns),
+                "sql": create_sql,
+                "database": CURRENT_DATABASE
+            }, f"Table '{table_name}' created successfully in database '{CURRENT_DATABASE}'")
+    except Exception as e:
+        logger.error(f"Failed to create table '{table_name}': {e}")
+        return format_error(e, f"Failed to create table '{table_name}'")
+
+# Tool: Create table from SQL
+@log_client_call
+@mcp.tool()
+def create_table_from_sql(create_table_sql: str) -> Dict[str, Any]:
+    """
+    Creates a table using a raw CREATE TABLE SQL statement.
+    
+    Args:
+        create_table_sql: Complete CREATE TABLE SQL statement
+        
+    Returns:
+        Dict containing operation status
+    """
+    if not CURRENT_DATABASE:
+        return format_error("No database selected", "Please use switch_database() to select a database first")
+    
+    if not create_table_sql or not isinstance(create_table_sql, str):
+        return format_error("Invalid SQL", "CREATE TABLE SQL statement must be a non-empty string")
+    
+    # Basic validation for CREATE TABLE statements
+    sql_lower = create_table_sql.strip().lower()
+    if not sql_lower.startswith('create table'):
+        return format_error("Invalid SQL", "Only CREATE TABLE statements are allowed")
+    
+    # Check for potentially dangerous operations
+    dangerous_keywords = ['drop', 'delete', 'update', 'insert', 'grant', 'revoke', 'execute']
+    for keyword in dangerous_keywords:
+        if keyword in sql_lower:
+            return format_error("Invalid SQL", f"SQL statement contains forbidden keyword: {keyword}")
+    
+    try:
+        with get_mysql_connection() as connection:
+            cursor = connection.cursor()
+            
+            # Execute the CREATE TABLE statement
+            cursor.execute(create_table_sql)
+            cursor.close()
+            
+            # Extract table name from SQL for response
+            # Simple extraction - look for table name after CREATE TABLE
+            import re
+            table_match = re.search(r'create\s+table\s+(?:if\s+not\s+exists\s+)?`?(\w+)`?', sql_lower)
+            table_name = table_match.group(1) if table_match else "unknown"
+            
+            return format_result({
+                "table_name": table_name,
+                "sql": create_table_sql,
+                "database": CURRENT_DATABASE
+            }, f"Table '{table_name}' created successfully in database '{CURRENT_DATABASE}'")
+    except Exception as e:
+        logger.error(f"Failed to create table from SQL: {e}")
+        return format_error(e, "Failed to create table from SQL")
 
 # Tool: Get table statistics
 @log_client_call
@@ -662,7 +796,7 @@ def get_table_stats(table_name: str) -> Dict[str, Any]:
 # Tool: Search data in table
 @log_client_call
 @mcp.tool()
-def search_table(table_name: str, search_column: str, search_value: str, limit: Optional[int] = 50) -> Dict[str, Any]:
+def search_table(table_name: str, search_column: str, search_value: str, limit: int = 50) -> Dict[str, Any]:
     """
     Searches for data in a specific column of the table.
     
@@ -684,20 +818,18 @@ def search_table(table_name: str, search_column: str, search_value: str, limit: 
     if not validate_table_name(search_column):
         return format_error("Invalid column name", "Column name contains invalid characters")
     
-    if limit is not None and (not isinstance(limit, int) or limit < 0):
+    if limit < 0:
         return format_error("Invalid limit", "Limit must be a positive integer")
     
     # Apply security limit
-    if limit is None or limit > SECURITY_CONFIG['max_results']:
+    if limit > SECURITY_CONFIG['max_results']:
         limit = SECURITY_CONFIG['max_results']
     
     try:
         with get_mysql_connection() as connection:
             cursor = connection.cursor(dictionary=True)
             
-            query = f"SELECT * FROM {table_name} WHERE {search_column} LIKE %s"
-            if limit is not None:
-                query += f" LIMIT {limit}"
+            query = f"SELECT * FROM {table_name} WHERE {search_column} LIKE %s LIMIT {limit}"
             
             search_pattern = f"%{search_value}%"
             cursor.execute(query, (search_pattern,))
@@ -1228,6 +1360,460 @@ def get_current_database() -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Failed to get current database: {e}")
         return format_error(e, "Failed to get current database")
+
+# Tool: Delete table
+@log_client_call
+@mcp.tool()
+def delete_table(table_name: str, force: bool = False) -> Dict[str, Any]:
+    """
+    Deletes a table from the current database.
+    
+    Args:
+        table_name: Name of the table to delete
+        force: If True, drops the table even if it doesn't exist (default: False)
+        
+    Returns:
+        Dict containing operation status
+    """
+    if not CURRENT_DATABASE:
+        return format_error("No database selected", "Please use switch_database() to select a database first")
+    
+    if not validate_table_name(table_name):
+        return format_error("Invalid table name", "Table name contains invalid characters")
+    
+    try:
+        with get_mysql_connection() as connection:
+            cursor = connection.cursor()
+            
+            if force:
+                query = f"DROP TABLE IF EXISTS `{table_name}`"
+            else:
+                query = f"DROP TABLE `{table_name}`"
+            
+            cursor.execute(query)
+            cursor.close()
+            
+            return format_result({
+                "table_name": table_name,
+                "force": force,
+                "database": CURRENT_DATABASE
+            }, f"Table '{table_name}' deleted successfully from database '{CURRENT_DATABASE}'")
+    except Exception as e:
+        logger.error(f"Failed to delete table '{table_name}': {e}")
+        return format_error(e, f"Failed to delete table '{table_name}'")
+
+# Tool: Truncate table
+@log_client_call
+@mcp.tool()
+def truncate_table(table_name: str) -> Dict[str, Any]:
+    """
+    Truncates a table (removes all data but keeps the structure).
+    
+    Args:
+        table_name: Name of the table to truncate
+        
+    Returns:
+        Dict containing operation status
+    """
+    if not CURRENT_DATABASE:
+        return format_error("No database selected", "Please use switch_database() to select a database first")
+    
+    if not validate_table_name(table_name):
+        return format_error("Invalid table name", "Table name contains invalid characters")
+    
+    try:
+        with get_mysql_connection() as connection:
+            cursor = connection.cursor()
+            
+            # Get row count before truncation
+            cursor.execute(f"SELECT COUNT(*) FROM `{table_name}`")
+            row_count = cursor.fetchone()[0]
+            
+            # Truncate the table
+            cursor.execute(f"TRUNCATE TABLE `{table_name}`")
+            cursor.close()
+            
+            return format_result({
+                "table_name": table_name,
+                "rows_removed": row_count,
+                "database": CURRENT_DATABASE
+            }, f"Table '{table_name}' truncated successfully, removed {row_count} rows from database '{CURRENT_DATABASE}'")
+    except Exception as e:
+        logger.error(f"Failed to truncate table '{table_name}': {e}")
+        return format_error(e, f"Failed to truncate table '{table_name}'")
+
+# Tool: Add column to table
+@log_client_call
+@mcp.tool()
+def add_column(table_name: str, column_name: str, column_type: str, constraints: List[str] = None, default_value: Any = None, after_column: str = None) -> Dict[str, Any]:
+    """
+    Adds a new column to an existing table.
+    
+    Args:
+        table_name: Name of the table to modify
+        column_name: Name of the new column
+        column_type: Data type of the new column
+        constraints: List of constraints (e.g., ['NOT NULL', 'UNIQUE'])
+        default_value: Default value for the column
+        after_column: Name of the column to place the new column after (optional)
+        
+    Returns:
+        Dict containing operation status
+    """
+    if not CURRENT_DATABASE:
+        return format_error("No database selected", "Please use switch_database() to select a database first")
+    
+    if not validate_table_name(table_name):
+        return format_error("Invalid table name", "Table name contains invalid characters")
+    
+    if not validate_table_name(column_name):
+        return format_error("Invalid column name", "Column name contains invalid characters")
+    
+    try:
+        with get_mysql_connection() as connection:
+            cursor = connection.cursor()
+            
+            # Build ALTER TABLE statement
+            alter_sql = f"ALTER TABLE `{table_name}` ADD COLUMN `{column_name}` {column_type}"
+            
+            # Add constraints
+            if constraints and isinstance(constraints, list):
+                for constraint in constraints:
+                    if isinstance(constraint, str):
+                        alter_sql += f" {constraint}"
+            
+            # Add default value
+            if default_value is not None:
+                if isinstance(default_value, str):
+                    alter_sql += f" DEFAULT '{default_value}'"
+                else:
+                    alter_sql += f" DEFAULT {default_value}"
+            
+            # Add position
+            if after_column and validate_table_name(after_column):
+                alter_sql += f" AFTER `{after_column}`"
+            
+            cursor.execute(alter_sql)
+            cursor.close()
+            
+            return format_result({
+                "table_name": table_name,
+                "column_name": column_name,
+                "column_type": column_type,
+                "constraints": constraints or [],
+                "default_value": default_value,
+                "after_column": after_column,
+                "database": CURRENT_DATABASE
+            }, f"Column '{column_name}' added successfully to table '{table_name}' in database '{CURRENT_DATABASE}'")
+    except Exception as e:
+        logger.error(f"Failed to add column '{column_name}' to table '{table_name}': {e}")
+        return format_error(e, f"Failed to add column '{column_name}' to table '{table_name}'")
+
+# Tool: Drop column from table
+@log_client_call
+@mcp.tool()
+def drop_column(table_name: str, column_name: str) -> Dict[str, Any]:
+    """
+    Removes a column from an existing table.
+    
+    Args:
+        table_name: Name of the table to modify
+        column_name: Name of the column to remove
+        
+    Returns:
+        Dict containing operation status
+    """
+    if not CURRENT_DATABASE:
+        return format_error("No database selected", "Please use switch_database() to select a database first")
+    
+    if not validate_table_name(table_name):
+        return format_error("Invalid table name", "Table name contains invalid characters")
+    
+    if not validate_table_name(column_name):
+        return format_error("Invalid column name", "Column name contains invalid characters")
+    
+    try:
+        with get_mysql_connection() as connection:
+            cursor = connection.cursor()
+            
+            # Build ALTER TABLE statement
+            alter_sql = f"ALTER TABLE `{table_name}` DROP COLUMN `{column_name}`"
+            
+            cursor.execute(alter_sql)
+            cursor.close()
+            
+            return format_result({
+                "table_name": table_name,
+                "column_name": column_name,
+                "database": CURRENT_DATABASE
+            }, f"Column '{column_name}' dropped successfully from table '{table_name}' in database '{CURRENT_DATABASE}'")
+    except Exception as e:
+        logger.error(f"Failed to drop column '{column_name}' from table '{table_name}': {e}")
+        return format_error(e, f"Failed to drop column '{column_name}' from table '{table_name}'")
+
+# Tool: Modify column in table
+@log_client_call
+@mcp.tool()
+def modify_column(table_name: str, column_name: str, new_type: str, new_constraints: List[str] = None, new_default: Any = None) -> Dict[str, Any]:
+    """
+    Modifies an existing column in a table.
+    
+    Args:
+        table_name: Name of the table to modify
+        column_name: Name of the column to modify
+        new_type: New data type for the column
+        new_constraints: New constraints for the column
+        new_default: New default value for the column
+        
+    Returns:
+        Dict containing operation status
+    """
+    if not CURRENT_DATABASE:
+        return format_error("No database selected", "Please use switch_database() to select a database first")
+    
+    if not validate_table_name(table_name):
+        return format_error("Invalid table name", "Table name contains invalid characters")
+    
+    if not validate_table_name(column_name):
+        return format_error("Invalid column name", "Column name contains invalid characters")
+    
+    try:
+        with get_mysql_connection() as connection:
+            cursor = connection.cursor()
+            
+            # Build ALTER TABLE statement
+            alter_sql = f"ALTER TABLE `{table_name}` MODIFY COLUMN `{column_name}` {new_type}"
+            
+            # Add constraints
+            if new_constraints and isinstance(new_constraints, list):
+                for constraint in new_constraints:
+                    if isinstance(constraint, str):
+                        alter_sql += f" {constraint}"
+            
+            # Add default value
+            if new_default is not None:
+                if isinstance(new_default, str):
+                    alter_sql += f" DEFAULT '{new_default}'"
+                else:
+                    alter_sql += f" DEFAULT {new_default}"
+            
+            cursor.execute(alter_sql)
+            cursor.close()
+            
+            return format_result({
+                "table_name": table_name,
+                "column_name": column_name,
+                "new_type": new_type,
+                "new_constraints": new_constraints or [],
+                "new_default": new_default,
+                "database": CURRENT_DATABASE
+            }, f"Column '{column_name}' modified successfully in table '{table_name}' in database '{CURRENT_DATABASE}'")
+    except Exception as e:
+        logger.error(f"Failed to modify column '{column_name}' in table '{table_name}': {e}")
+        return format_error(e, f"Failed to modify column '{column_name}' in table '{table_name}'")
+
+# Tool: Rename table
+@log_client_call
+@mcp.tool()
+def rename_table(old_table_name: str, new_table_name: str) -> Dict[str, Any]:
+    """
+    Renames a table in the current database.
+    
+    Args:
+        old_table_name: Current name of the table
+        new_table_name: New name for the table
+        
+    Returns:
+        Dict containing operation status
+    """
+    if not CURRENT_DATABASE:
+        return format_error("No database selected", "Please use switch_database() to select a database first")
+    
+    if not validate_table_name(old_table_name):
+        return format_error("Invalid old table name", "Old table name contains invalid characters")
+    
+    if not validate_table_name(new_table_name):
+        return format_error("Invalid new table name", "New table name contains invalid characters")
+    
+    try:
+        with get_mysql_connection() as connection:
+            cursor = connection.cursor()
+            
+            # Build RENAME TABLE statement
+            rename_sql = f"RENAME TABLE `{old_table_name}` TO `{new_table_name}`"
+            
+            cursor.execute(rename_sql)
+            cursor.close()
+            
+            return format_result({
+                "old_table_name": old_table_name,
+                "new_table_name": new_table_name,
+                "database": CURRENT_DATABASE
+            }, f"Table '{old_table_name}' renamed successfully to '{new_table_name}' in database '{CURRENT_DATABASE}'")
+    except Exception as e:
+        logger.error(f"Failed to rename table '{old_table_name}' to '{new_table_name}': {e}")
+        return format_error(e, f"Failed to rename table '{old_table_name}' to '{new_table_name}'")
+
+# Tool: Get table indexes
+@log_client_call
+@mcp.tool()
+def get_table_indexes(table_name: str) -> Dict[str, Any]:
+    """
+    Gets information about indexes on the specified table.
+    
+    Args:
+        table_name: Name of the table to get indexes for
+        
+    Returns:
+        Dict containing index information
+    """
+    if not CURRENT_DATABASE:
+        return format_error("No database selected", "Please use switch_database() to select a database first")
+    
+    if not validate_table_name(table_name):
+        return format_error("Invalid table name", "Table name contains invalid characters")
+    
+    try:
+        with get_mysql_connection() as connection:
+            cursor = connection.cursor()
+            
+            # Get index information
+            cursor.execute(f"SHOW INDEX FROM `{table_name}`")
+            indexes = cursor.fetchall()
+            cursor.close()
+            
+            # Process index information
+            index_info = {}
+            for row in indexes:
+                index_name = row[2]
+                if index_name not in index_info:
+                    index_info[index_name] = {
+                        "name": index_name,
+                        "type": "UNIQUE" if row[1] == 0 else "NONUNIQUE",
+                        "columns": []
+                    }
+                
+                index_info[index_name]["columns"].append({
+                    "column_name": row[4],
+                    "seq_in_index": row[3],
+                    "collation": row[5],
+                    "cardinality": row[6],
+                    "sub_part": row[7],
+                    "packed": row[8],
+                    "null": row[9],
+                    "index_type": row[10]
+                })
+            
+            return format_result({
+                "table_name": table_name,
+                "indexes": list(index_info.values()),
+                "index_count": len(index_info),
+                "database": CURRENT_DATABASE
+            }, f"Retrieved {len(index_info)} indexes for table '{table_name}' in database '{CURRENT_DATABASE}'")
+    except Exception as e:
+        logger.error(f"Failed to get indexes for table '{table_name}': {e}")
+        return format_error(e, f"Failed to get indexes for table '{table_name}'")
+
+# Tool: Create index on table
+@log_client_call
+@mcp.tool()
+def create_index(table_name: str, index_name: str, columns: List[str], index_type: str = "BTREE", unique: bool = False) -> Dict[str, Any]:
+    """
+    Creates an index on the specified table.
+    
+    Args:
+        table_name: Name of the table to create index on
+        index_name: Name of the index
+        columns: List of column names to include in the index
+        index_type: Type of index (e.g., 'BTREE', 'HASH')
+        unique: Whether the index should be unique
+        
+    Returns:
+        Dict containing operation status
+    """
+    if not CURRENT_DATABASE:
+        return format_error("No database selected", "Please use switch_database() to select a database first")
+    
+    if not validate_table_name(table_name):
+        return format_error("Invalid table name", "Table name contains invalid characters")
+    
+    if not validate_table_name(index_name):
+        return format_error("Invalid index name", "Index name contains invalid characters")
+    
+    if not columns or not isinstance(columns, list):
+        return format_error("Invalid columns", "Columns must be a non-empty list")
+    
+    # Validate column names
+    for col in columns:
+        if not validate_table_name(col):
+            return format_error("Invalid column name", f"Column name '{col}' contains invalid characters")
+    
+    try:
+        with get_mysql_connection() as connection:
+            cursor = connection.cursor()
+            
+            # Build CREATE INDEX statement
+            unique_clause = "UNIQUE" if unique else ""
+            columns_clause = ", ".join([f"`{col}`" for col in columns])
+            
+            create_sql = f"CREATE {unique_clause} INDEX `{index_name}` ON `{table_name}` ({columns_clause}) USING {index_type}"
+            
+            cursor.execute(create_sql)
+            cursor.close()
+            
+            return format_result({
+                "table_name": table_name,
+                "index_name": index_name,
+                "columns": columns,
+                "index_type": index_type,
+                "unique": unique,
+                "database": CURRENT_DATABASE
+            }, f"Index '{index_name}' created successfully on table '{table_name}' in database '{CURRENT_DATABASE}'")
+    except Exception as e:
+        logger.error(f"Failed to create index '{index_name}' on table '{table_name}': {e}")
+        return format_error(e, f"Failed to create index '{index_name}' on table '{table_name}'")
+
+# Tool: Drop index from table
+@log_client_call
+@mcp.tool()
+def drop_index(table_name: str, index_name: str) -> Dict[str, Any]:
+    """
+    Removes an index from the specified table.
+    
+    Args:
+        table_name: Name of the table to remove index from
+        index_name: Name of the index to remove
+        
+    Returns:
+        Dict containing operation status
+    """
+    if not CURRENT_DATABASE:
+        return format_error("No database selected", "Please use switch_database() to select a database first")
+    
+    if not validate_table_name(table_name):
+        return format_error("Invalid table name", "Table name contains invalid characters")
+    
+    if not validate_table_name(index_name):
+        return format_error("Invalid index name", "Index name contains invalid characters")
+    
+    try:
+        with get_mysql_connection() as connection:
+            cursor = connection.cursor()
+            
+            # Build DROP INDEX statement
+            drop_sql = f"DROP INDEX `{index_name}` ON `{table_name}`"
+            
+            cursor.execute(drop_sql)
+            cursor.close()
+            
+            return format_result({
+                "table_name": table_name,
+                "index_name": index_name,
+                "database": CURRENT_DATABASE
+            }, f"Index '{index_name}' dropped successfully from table '{table_name}' in database '{CURRENT_DATABASE}'")
+    except Exception as e:
+        logger.error(f"Failed to drop index '{index_name}' from table '{table_name}': {e}")
+        return format_error(e, f"Failed to drop index '{index_name}' from table '{table_name}'")
 
 # Start the MCP server
 if __name__ == "__main__":
