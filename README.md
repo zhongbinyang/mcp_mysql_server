@@ -94,7 +94,7 @@ python mcp-mysql-server.py
 - `allow_system_db_operations` - 是否允许操作系统数据库（默认：False）
 - `max_database_name_length` - 数据库名称最大长度（默认：64）
 - `backup_before_delete` - 删除前是否自动备份（默认：True）
-- `auto_switch_on_create` - 创建数据库后是否自动切换（默认：False）
+- `auto_switch_on_create` - 创建数据库后是否自动切换（默认：True）
 
 ## 使用示例
 

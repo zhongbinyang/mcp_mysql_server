@@ -53,5 +53,5 @@ DB_MANAGEMENT_CONFIG: Dict[str, Any] = {
     'allow_system_db_operations': False,  # Whether to allow operations on system databases
     'max_database_name_length': 64,  # Maximum length for database names
     'backup_before_delete': True,  # Whether to create backup before deleting database
-    'auto_switch_on_create': False  # Whether to automatically switch to newly created database
+    'auto_switch_on_create': True  # Whether to automatically switch to newly created database
 } 
